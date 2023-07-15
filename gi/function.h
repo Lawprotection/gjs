@@ -108,6 +108,7 @@ class GjsFunctionCallState {
     uint8_t gi_argc = 0;
     uint8_t processed_c_args = 0;
     bool failed : 1;
+    bool has_async_return : 1;
     bool can_throw_gerror : 1;
     bool is_method : 1;
 
@@ -117,6 +118,7 @@ class GjsFunctionCallState {
           info(callable),
           gi_argc(g_callable_info_get_n_args(callable)),
           failed(false),
+          has_async_return(false),
           can_throw_gerror(g_callable_info_can_throw_gerror(callable)),
           is_method(g_callable_info_is_method(callable)) {
         int size = gi_argc + first_arg_offset();
@@ -159,6 +161,10 @@ class GjsFunctionCallState {
         return first_arg_offset() + processed_c_args;
     }
 
+    [[nodiscard]] bool is_async() { return has_async_return; }
+
+    void mark_async() { has_async_return = true; }
+
     [[nodiscard]] GjsAutoChar display_name() {
         GIBaseInfo* container = g_base_info_get_container(info);  // !owned
         if (container) {
@@ -182,5 +188,10 @@ bool gjs_invoke_constructor_from_c(JSContext* cx, GIFunctionInfo* info,
                                    JS::HandleObject this_obj,
                                    const JS::CallArgs& args,
                                    GIArgument* rvalue);
+
+GJS_JSAPI_RETURN_CONVENTION
+bool gjs_invoke_finish_from_c(JSContext* cx, GICallableInfo* info,
+                              JS::HandleObject this_obj, GAsyncResult* result,
+                              JS::MutableHandleValue rvalue);
 
 #endif  // GI_FUNCTION_H_

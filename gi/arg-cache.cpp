@@ -17,6 +17,7 @@
 #include <utility>
 
 #include <ffi.h>
+#include <gio/gio.h>
 #include <girepository.h>
 #include <glib.h>
 
@@ -692,8 +693,102 @@ struct CallbackIn : SkipAll, Callback {
 
     bool release(JSContext*, GjsFunctionCallState*, GIArgument*,
                  GIArgument*) override;
- private:
+
+ protected:
     ffi_closure *m_ffi_closure;
+};
+
+class AsyncCallbackData {
+    JS::Heap<JSObject*> m_promise;
+
+ public:
+    JSContext* cx;
+    GjsAutoBaseInfo callable_info;
+
+    static void trace(JSTracer* trc, void* data) {
+        auto* self = AsyncCallbackData::from_ptr(data);
+
+        JS::TraceEdge(trc, &self->m_promise, "promise");
+    }
+
+ public:
+    explicit AsyncCallbackData() {
+        m_promise = nullptr;
+        cx = nullptr;
+        callable_info = nullptr;
+    }
+
+    ~AsyncCallbackData() {
+        if (m_promise)
+            JS_RemoveExtraGCRootsTracer(cx, &AsyncCallbackData::trace, this);
+        m_promise = nullptr;
+        cx = nullptr;
+        callable_info = nullptr;
+    }
+
+    GICallableInfo* callable() { return callable_info.get(); }
+
+    JSContext* context() { return cx; }
+
+    JSObject* execute(JSContext* a_cx, GjsAutoCallableInfo info) {
+        cx = a_cx;
+        JS::RootedObject promise(cx, JS::NewPromiseObject(cx, nullptr));
+        m_promise = promise;
+
+        JS_AddExtraGCRootsTracer(cx, &AsyncCallbackData::trace, this);
+
+        callable_info = info;
+
+        return m_promise;
+    }
+
+    JSObject* promise() { return m_promise.get(); }
+
+    static AsyncCallbackData* from_ptr(void* ptr) {
+        return static_cast<AsyncCallbackData*>(ptr);
+    }
+
+    bool resolve(JS::HandleValue val) {
+        JS::RootedObject o(cx, m_promise.get());
+
+        return JS::ResolvePromise(cx, o, val);
+    }
+
+    bool reject() {
+        JS::RootedObject o(cx, m_promise.get());
+
+        JS::RootedValue rejection_value(cx);
+
+        if (!JS_GetPendingException(cx, &rejection_value)) {
+            return false;
+        }
+
+        // Clear the pending exception and use it to reject the promise
+        JS_ClearPendingException(cx);
+
+        return JS::RejectPromise(cx, o, rejection_value);
+    }
+};
+
+struct AsyncCallbackIn : CallbackIn {
+    AsyncCallbackData m_data;
+
+    explicit AsyncCallbackIn(GIInterfaceInfo* info, GICallableInfo* finish_info)
+        : CallbackIn(info),
+          m_finish_info(finish_info, GjsAutoTakeOwnership{}) {}
+
+    bool in(JSContext*, GjsFunctionCallState*, GIArgument*,
+            JS::HandleValue) override;
+
+    bool release(JSContext*, GjsFunctionCallState*, GIArgument*,
+                 GIArgument*) override;
+
+    bool out(JSContext* cx, GjsFunctionCallState*, GIArgument*,
+             JS::MutableHandleValue) override;
+
+ private:
+    GjsAutoBaseInfo m_finish_info;
+    ffi_closure* m_finish_closure;
 };
 
 using CArrayIn = ExplicitArrayIn;
@@ -896,6 +991,71 @@ bool CallbackIn::in(JSContext* cx, GjsFunctionCallState* state, GIArgument* arg,
     }
     gjs_arg_set(arg, closure);
 
+    return true;
+}
+
+static void promisified_callback(GObject* ObjectBase, GAsyncResult* res,
+                                 void* data) {
+    auto* promise = AsyncCallbackData::from_ptr(data);
+
+    auto finish = promise->callable();
+
+    JS::RootedValue ret(promise->context());
+    JS::RootedObject thiso(promise->context(),
+                           ObjectBase ? ObjectInstance::wrapper_from_gobject(
+                                            promise->context(), ObjectBase)
+                                      : nullptr);
+    JS::AutoSaveExceptionState saved_exc(promise->context());
+    if (!gjs_invoke_finish_from_c(promise->context(), finish, thiso, res,
+                                  &ret)) {
+        if (!promise->reject()) {
+            g_error("Failed to reject promise for async function");
+        }
+
+        return;
+    }
+
+    if (!promise->resolve(ret)) {
+        // TODO: Move logging into promise utility class
+        gjs_log_exception(promise->context());
+        return;
+    }
+}
+
+GJS_JSAPI_RETURN_CONVENTION
+bool AsyncCallbackIn::in(JSContext* cx, GjsFunctionCallState* state,
+                         GIArgument* arg, JS::HandleValue value) {
+    if (value.isNullOrUndefined()) {
+        m_ffi_closure = nullptr;
+
+        if (has_callback_closure()) {
+            state->mark_async();
+            m_data.execute(cx, static_cast<GICallbackInfo*>(m_finish_info));
+
+            gjs_arg_set(arg, promisified_callback);
+            gjs_arg_set(&state->in_cvalue(m_closure_pos), &m_data);
+        }
+
+        return true;
+    }
+
+    return CallbackIn::in(cx, state, arg, value);
+}
+
+bool AsyncCallbackIn::out(JSContext* cx, GjsFunctionCallState* state,
+                          GIArgument*, JS::MutableHandleValue) {
+    // TODO: Should this ever be false?
+    if (!has_callback_closure())
+        return true;
+
+    if (!state->is_async())
+        return true;
+
+    // TODO: Clean this up
+    g_assert(m_data.callable() && "Async callback missing callable info.");
+
+    JS::RootedObject promise(cx, m_data.promise());
+    state->return_values[0].setObject(*promise);
     return true;
 }
 
@@ -1430,6 +1590,13 @@ bool CallbackIn::release(JSContext*, GjsFunctionCallState*, GIArgument* in_arg,
     // check its scope at this point
     gjs_arg_unset<void*>(in_arg);
     return true;
+}
+
+GJS_JSAPI_RETURN_CONVENTION
+bool AsyncCallbackIn::release(JSContext* cx, GjsFunctionCallState* cs,
+                              GIArgument* in_arg,
+                              GIArgument* out_arg [[maybe_unused]]) {
+    return CallbackIn::release(cx, cs, in_arg, out_arg);
 }
 
 GJS_JSAPI_RETURN_CONVENTION
@@ -2178,6 +2345,7 @@ void ArgsCache::build_arg(uint8_t gi_index, GIDirection direction,
                 return;
             }
 
+            auto has_finish = g_callable_info_has_finish(callable);
             if (strcmp(interface_info.name(), "DestroyNotify") == 0 &&
                 strcmp(interface_info.ns(), "GLib") == 0) {
                 // We don't know (yet) what to do with GDestroyNotify appearing
@@ -2189,6 +2357,36 @@ void ArgsCache::build_arg(uint8_t gi_index, GIDirection direction,
                 set_argument_auto<Arg::NotIntrospectable>(
                     common_args, DESTROY_NOTIFY_NO_CALLBACK);
                 *inc_counter_out = false;
+            } else if (has_finish &&
+                       strcmp(interface_info.name(), "AsyncReadyCallback") ==
+                           0 &&
+                       strcmp(interface_info.ns(), "Gio") == 0) {
+                auto* finish_callable =
+                    g_callable_info_get_finish_function(callable);
+                g_base_info_ref(finish_callable);
+                g_base_info_ref(interface_info);
+
+                auto* gjs_arg = set_argument_auto<Arg::AsyncCallbackIn>(
+                    common_args, interface_info, finish_callable);
+
+                int destroy_pos = g_arg_info_get_destroy(arg);
+                int closure_pos = g_arg_info_get_closure(arg);
+
+                if (destroy_pos >= 0)
+                    set_skip_all(destroy_pos);
+
+                if (closure_pos >= 0)
+                    set_skip_all(closure_pos);
+
+                if (destroy_pos >= 0 && closure_pos < 0) {
+                    set_argument_auto<Arg::NotIntrospectable>(
+                        common_args, DESTROY_NOTIFY_NO_USER_DATA);
+                    return;
+                }
+
+                gjs_arg->m_scope = g_arg_info_get_scope(arg);
+                gjs_arg->set_callback_destroy_pos(destroy_pos);
+                gjs_arg->set_callback_closure_pos(closure_pos);
             } else {
                 auto* gjs_arg = set_argument_auto<Arg::CallbackIn>(
                     common_args, interface_info);
